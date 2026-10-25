@@ -226,34 +226,111 @@ To integrate Snapcast into [Buildroot](https://buildroot.org/), please follow th
 
 ### webOS (Cross compile)
 
-To cross compile Snapcast client for LG webOS TVs, you need the webOS SDK and toolchain.
+To cross compile Snapcast client for LG webOS TVs, you need a toolchain for the device's C++ ABI.
 
-#### Prerequisites
+#### Target platform notes
 
-Install the [openlgtv buildroot toolchain](https://github.com/openlgtv/buildroot-nc4)
+webOS TVs with ARM SoCs (webOS 3 and later) run a **32-bit armv7 userland with soft-float
+calling convention** (`arm-linux-gnueabi`, Debian's `armel` architecture). Newer TVs
+("starfish", webOS 5 and later) additionally run a 64-bit kernel and report `aarch64` from
+`uname`, but the userland ABI is unchanged: binaries are ELF32, the dynamic linker is
+`/lib/ld-linux.so.3` and `.ARM.attributes` lack `Tag_ABI_VFP_args`. An `armhf` (hard-float)
+build is incompatible and an `aarch64` build cannot even load. Verify the target over SSH:
 
-#### Build Steps
+```sh
+readelf -A /bin/sh   # no "Tag_ABI_VFP_args" => armel (soft-float) is required
+```
 
-1. Configure the build for webOS target:
+#### Build Steps (Debian bullseye, tested on webOS 9.2.4)
 
-    ```sh
-    mkdir build
-    cd build
+Debian bullseye ships glibc 2.31, GCC 10, SDL2 2.0.14 and Boost 1.74, so the resulting
+binary runs unmodified on webOS 5 to 9: those TVs ship glibc >= 2.31 and already provide
+`libSDL2-2.0.so.0`, `libasound.so.2`, `libFLAC.so.8`, `libogg.so.0`, `libvorbis.so.0` and
+`libopus.so.0` in `/usr/lib` (link `libstdc++` statically to stay independent of the
+device's `libstdc++` version). Debian publishes no armel container image, so run the
+armel rootfs from `multiarch/debian-debootstrap` under qemu:
 
-    # Configure with webOS toolchain
-    cmake .. \
-        -G Ninja \
-        -DCMAKE_TOOLCHAIN_FILE=/path/to/openlgtv/toolchain.cmake \
-        -DBUILD_WITH_SDL2=ON \
-        -DBUILD_SERVER=OFF \
-        -DBUILD_CLIENT=ON \
-        -DBUILD_WITH_ALSA=OFF \
-        -DBUILD_WITH_PULSE=OFF \
-        -DBUILD_WITH_PIPEWIRE=OFF
-    ```
+```sh
+# register qemu for ARM containers (once per host)
+docker run --privileged --rm tonistiigi/binfmt --install arm
 
-2. Build the client:
+docker run --rm -v "$PWD":/src:ro multiarch/debian-debootstrap:armel-bullseye bash
+```
 
-    ```sh
-    cmake --build -j
-    ```
+Inside the container (bullseye moved to `archive.debian.org`):
+
+```sh
+printf 'deb http://archive.debian.org/debian bullseye main\n' > /etc/apt/sources.list
+apt-get -o Acquire::Check-Valid-Until=false update
+apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config \
+    libboost-dev libsdl2-dev libpulse-dev libasound2-dev libflac-dev libogg-dev libvorbis-dev \
+    libopus-dev libexpat1-dev libsoxr-dev
+
+cp -a /src /work && cd /work
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
+    -DCMAKE_CXX_FLAGS="-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=softfp" \
+    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+    -DBUILD_WITH_SDL2=ON \
+    -DBUILD_WITH_PULSE=ON \
+    -DBUILD_SERVER=OFF \
+    -DBUILD_CLIENT=ON \
+    -DBUILD_WITH_ALSA=OFF \
+    -DBUILD_WITH_PIPEWIRE=OFF
+cmake --build build
+```
+
+The binary is written to `bin/snapclient`.
+
+`libsoxr-dev` is auto-detected by CMake and enables the soxr resampler, which the
+client uses to lock its audio clock to the server and absorb clock drift (without
+it snapclient logs `Soxr not available, resampling not supported` and will slowly
+drift out of sync). Debian ships only a shared soxr, so copy `libsoxr.so.1*` from
+the container's `/usr/lib/*/` next to the binary and start the client with
+`LD_LIBRARY_PATH=/media/internal/downloads` if the TV has no libsoxr of its own.
+
+#### Deploy and run
+
+Root access via [RootMy.TV](https://rootmy.tv) or the
+[webosbrew](https://github.com/webosbrew) tooling. `/media/internal` survives reboots.
+
+webOS uses PulseAudio (system mode) as its native audio mixer, so build with
+`-DBUILD_WITH_PULSE=ON` and use the `pulse` player. The server socket path is
+model specific; on webOS 9.2.4 it is `/tmp/var/run/pulse/native` (check with
+`ls /tmp/var/run/pulse /run/pulse /tmp/pulse`):
+
+```sh
+scp bin/snapclient root@<tv-ip>:/media/internal/
+ssh root@<tv-ip> 'chmod +x /media/internal/snapclient \
+    && PULSE_SERVER=unix:/tmp/var/run/pulse/native \
+       /media/internal/snapclient tcp://<server-ip>:1704 --player pulse'
+```
+
+#### Latency
+
+Measured on webOS 9.2.4, the acoustic output of the pulse player lags a desktop
+reference client by roughly 85-95 ms. `--latency <ms>` shifts playback earlier by
+1 ms per 1 ms set (verified by recording both speakers and cross-correlating a
+click test signal), so a positive value compensates a late device and brings the
+TV into sync with the rest of the group. The value must be set at client startup:
+changing the latency of an already-playing client can starve its buffer
+(silence) or destabilize it, so restart the client instead.
+
+Which audio players work on webOS:
+
+- `pulse`: the only player with real playback-latency feedback on webOS, and it
+  follows the system audio policy (routing, ducking, `media.role=music`)
+- `sdl2`: works as a fallback because the `libSDL2` shipped on the TV routes
+  audio via PulseAudio, but SDL2 exposes no playback position/latency API, so
+  snapclient has to assume a constant latency and timing is noticeably less
+  stable than with the pulse player
+- `alsa`: PCM devices are listed (`sysdefault:CARD=...`) but playback fails
+  with `XRUN`/`Broken pipe`, because the codec is owned by the webOS audio
+  server; do not use
+
+#### Build Steps (older TVs, openlgtv toolchain)
+
+For pre-starfish TVs (webOS 3.x/4.x), the
+[openlgtv buildroot toolchain](https://github.com/openlgtv/buildroot-nc4) provides a
+matching `arm-webos-linux-gnueabi` sysroot and can be used with
+`-DCMAKE_TOOLCHAIN_FILE=<toolchain>/toolchain.cmake` and the same CMake options as above.
