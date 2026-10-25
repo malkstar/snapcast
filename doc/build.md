@@ -228,6 +228,25 @@ To integrate Snapcast into [Buildroot](https://buildroot.org/), please follow th
 
 To cross compile Snapcast client for LG webOS TVs, you need a toolchain for the device's C++ ABI.
 
+webOS apps cannot open the ALSA codec directly because it is owned by the webOS
+audio server, and the device's own audio stack is PulseAudio (system mode), so
+the sync-accurate setup is the `pulse` player described in
+[Deploy and run](#deploy-and-run). When PulseAudio is unavailable or broken on
+a device, snapclient can instead be built and run with the **SDL2 player**: the
+`libSDL2` shipped on the TV routes SDL audio through that same PulseAudio
+mixer, so playback works without any webOS-specific client code. The steps
+below build a single binary containing both players.
+
+> **SDL2 is a fallback only: more casting than sync-casting.** SDL2 exposes no
+> playback position/latency query, so snapclient has to assume a constant
+> latency for it, and the webOS audio stack does not provide one: its
+> PulseAudio-based mixer varies its latency at runtime. The result is audible,
+> dropout-free playback with degraded multi-room sync: this mode is closer to
+> casting than to synchronized casting. Use the `pulse` player for any real
+> sync group and fall back to SDL2 only where PulseAudio cannot be used. The
+> SDL2 delta is just `-DBUILD_WITH_SDL2=ON` plus `--player sdl2`; see
+> [Deploy and run](#deploy-and-run) and [SDL2 fallback](#sdl2-fallback) below.
+
 #### Target platform notes
 
 webOS TVs with ARM SoCs (webOS 3 and later) run a **32-bit armv7 userland with soft-float
@@ -294,10 +313,10 @@ the container's `/usr/lib/*/` next to the binary and start the client with
 Root access via [RootMy.TV](https://rootmy.tv) or the
 [webosbrew](https://github.com/webosbrew) tooling. `/media/internal` survives reboots.
 
-webOS uses PulseAudio (system mode) as its native audio mixer, so build with
-`-DBUILD_WITH_PULSE=ON` and use the `pulse` player. The server socket path is
-model specific; on webOS 9.2.4 it is `/tmp/var/run/pulse/native` (check with
-`ls /tmp/var/run/pulse /run/pulse /tmp/pulse`):
+Use the `pulse` player: webOS mixes audio through its system PulseAudio
+instance, and its socket path is model specific; on webOS 9.2.4 it is
+`/tmp/var/run/pulse/native` (check with `ls /tmp/var/run/pulse /run/pulse
+/tmp/pulse`):
 
 ```sh
 scp bin/snapclient root@<tv-ip>:/media/internal/
@@ -305,6 +324,28 @@ ssh root@<tv-ip> 'chmod +x /media/internal/snapclient \
     && PULSE_SERVER=unix:/tmp/var/run/pulse/native \
        /media/internal/snapclient tcp://<server-ip>:1704 --player pulse'
 ```
+
+#### SDL2 fallback
+
+When PulseAudio is unavailable or broken on the device (no server socket to
+connect to, or a non-working one), run the very same binary with the SDL2
+player instead: the build above already contains both players, so the only
+delta is to replace `--player pulse` with `--player sdl2`:
+
+```sh
+ssh root@<tv-ip> '/media/internal/snapclient tcp://<server-ip>:1704 --player sdl2'
+```
+
+Keep a `PULSE_SERVER=unix:<path>` prefix if the pulse player needed one: the
+`libSDL2` shipped on the TV routes SDL audio via PulseAudio too. For a minimal
+fallback-only build, swap `-DBUILD_WITH_PULSE=ON` for `-DBUILD_WITH_SDL2=ON` in
+the configure step; everything else, including the soxr notes above, applies
+unchanged.
+
+Keep the warning at the head of this section in mind: since SDL2 cannot report
+the playback position, `--latency <ms>` can only hide a constant offset, not
+track a varying one, so the client behaves more like a cast receiver than a
+member of a sync group.
 
 #### Latency
 
@@ -320,10 +361,12 @@ Which audio players work on webOS:
 
 - `pulse`: the only player with real playback-latency feedback on webOS, and it
   follows the system audio policy (routing, ducking, `media.role=music`)
-- `sdl2`: works as a fallback because the `libSDL2` shipped on the TV routes
-  audio via PulseAudio, but SDL2 exposes no playback position/latency API, so
-  snapclient has to assume a constant latency and timing is noticeably less
-  stable than with the pulse player
+- `sdl2`: fallback only (see [SDL2 fallback](#sdl2-fallback) above): works
+  because the `libSDL2` shipped on the TV routes audio via PulseAudio, but SDL2
+  exposes no playback position/latency API, so snapclient has to assume a
+  constant latency that the webOS mixer does not actually provide; timing is
+  noticeably less stable than with the pulse player, closer to casting than to
+  synchronized casting
 - `alsa`: PCM devices are listed (`sysdefault:CARD=...`) but playback fails
   with `XRUN`/`Broken pipe`, because the codec is owned by the webOS audio
   server; do not use
